@@ -1,0 +1,325 @@
+import os
+import time
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+import PyPDF2
+import re
+import csv
+import json
+import pickle
+import xml.etree.ElementTree as ET
+import string
+from collections import Counter
+from nltk.corpus import stopwords
+import nltk
+
+# Download stopwords if not already downloaded
+try:
+    stopwords.words('english')
+except LookupError:
+    nltk.download('stopwords')
+    from nltk.corpus import stopwords
+
+class CaseData:
+    """
+    A data structure to hold extracted information from a PDF case file.
+    """
+    def __init__(self, file_name=None, case_name=None, judges=None, facts=None,
+                 legal_issues=None, holdings=None, reasoning=None, citations=None,
+                 classification=None):
+        self.file_name = file_name
+        self.case_name = case_name
+        self.judges = judges
+        self.facts = facts
+        self.legal_issues = legal_issues
+        self.holdings = holdings
+        self.reasoning = reasoning
+        self.citations = citations
+        self.classification = classification
+
+def classify_case(case_data):
+    """
+    Classifies a CaseData object based on keywords in its content.
+
+    Args:
+        case_data: A CaseData object.
+    """
+    classification = "Unclassified"
+    text_to_classify = ""
+
+    # Concatenate relevant text fields for classification
+    if case_data.holdings:
+        text_to_classify += case_data.holdings.lower()
+    if case_data.reasoning:
+        text_to_classify += case_data.reasoning.lower()
+    if case_data.case_name:
+        text_to_classify += case_data.case_name.lower()
+    if case_data.file_name:
+        text_to_classify += case_data.file_name.lower()
+
+
+    # Define keywords for classification
+    keywords = {
+        "Dismissal": ["dismissal"],
+        "Decision": ["decision"],
+        "Summary Judgment": ["summary judgment"],
+        "Order": ["order"],
+        "Judge": ["judge", "judges", "justice"],
+        "Jurisdiction": ["jurisdiction", "venue", "authority"],
+        "Site condition": ["site condition", "site conditions", "differing site condition", "differing site conditions"],
+        "Christian": ["christian"], # Specific keyword as requested
+        "breach of contract": ["breach of contract", "breach of the agreement"],
+        "breach of duty of good faith and fair dealing": ["breach of duty of good faith and fair dealing"],
+        "bankrupt": ["bankrupt", "bankruptcy", "insolvent"],
+        "government claim": ["government claim", "government claims", "claim against the government"],
+        "untimely": ["untimely", "late", "time-barred"],
+        "fraud": ["fraud", "fraudulent", "misrepresentation"],
+        "terms of service": ["terms of service", "terms and conditions", "agreement terms"],
+        "subcontractor": ["subcontractor", "subcontractors"]
+    }
+
+
+    for class_name, terms in keywords.items():
+        for term in terms:
+            if term in text_to_classify:
+                classification = class_name
+                break # Assign the first matching classification and move to the next case
+        if classification != "Unclassified":
+            break # Stop checking keywords if a classification is found
+
+    case_data.classification = classification
+
+
+def main():
+    # --- Web scraping ---
+    url = "https://cbca.gov/decisions/cda-cases.html"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        pdf_links = []
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            if href.lower().endswith('.pdf'):
+                pdf_links.append(href)
+        print(f"Found {len(pdf_links)} PDF links.")
+    except requests.exceptions.RequestException as e:
+        print(f"Error during request: {e}")
+        return # Exit if scraping fails
+
+    # --- PDF downloading ---
+    download_dir = 'downloaded_pdfs'
+    if not os.path.exists(download_dir):
+        os.makedirs(download_dir)
+        print(f"Created directory: {download_dir}")
+    else:
+        print(f"Directory already exists: {download_dir}")
+
+    base_url = "https://cbca.gov/decisions/"
+    download_count = 0
+
+    for link in pdf_links:
+        full_url = urljoin(base_url, link)
+        filename = os.path.join(download_dir, os.path.basename(full_url))
+
+        if not os.path.exists(filename): # Skip download if file already exists
+            try:
+                response = requests.get(full_url, stream=True)
+                response.raise_for_status()
+
+                temp_filename = filename + ".temp"
+                with open(temp_filename, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                try:
+                    with open(temp_filename, 'rb') as f:
+                        reader = PyPDF2.PdfReader(f)
+                        num_pages = len(reader.pages)
+
+                    if num_pages <= 2:
+                        print(f"Skipping {full_url} as it has only {num_pages} page(s).")
+                        os.remove(temp_filename)
+                        continue
+                    else:
+                        os.rename(temp_filename, filename)
+                        print(f"Successfully downloaded: {filename} with {num_pages} pages.")
+                        download_count += 1
+
+                except PyPDF2.errors.PdfReadError:
+                     print(f"Could not read PDF file {full_url}. Skipping.")
+                     os.remove(temp_filename)
+                     continue
+
+                if download_count > 0 and download_count % 10 == 0:
+                    print("Pausing for 10 seconds for rate limiting...")
+                    time.sleep(10)
+
+            except requests.exceptions.RequestException as e:
+                print(f"Error downloading {full_url}: {e}")
+            except IOError as e:
+                print(f"Error saving file {filename}: {e}")
+        else:
+            print(f"File already exists: {filename}. Skipping download.")
+
+
+    # --- Extract data from pdfs ---
+    all_cases_data = []
+    patterns = {
+        "case_name": r"Case Name:\s*(.*?)\n",
+        "judges": r"Judges:\s*(.*?)\n",
+        "facts": r"Facts\s*\n(.*?)(?=\nLegal Issues|\nHoldings|\nReasoning|\nCitations|\n\Z)|Background\s*\n(.*?)(?=\nLegal Issues|\nHoldings|\nReasoning|\nCitations|\n\Z)",
+        "legal_issues": r"Legal Issues\s*\n(.*?)(?=\nFacts|\nHoldings|\nReasoning|\nCitations|\n\Z)",
+        "holdings": r"Holdings\s*\n(.*?)(?=\nFacts|\nLegal Issues|\nReasoning|\nCitations|\n\Z)|Decision\s*\n(.*?)(?=\nFacts|\nLegal Issues|\nReasoning|\nCitations|\n\Z)",
+        "reasoning": r"Reasoning\s*\n(.*?)(?=\nFacts|\nLegal Issues|\nHoldings|\nCitations|\n\Z)|Discussion\s*\n(.*?)(?=\nFacts|\nLegal Issues|\nHoldings|\nCitations|\n\Z)",
+        "citations": r"Citations\s*\n(.*?)(?=\nFacts|\nLegal Issues|\nHoldings|\nReasoning|\n\Z)"
+    }
+
+    for filename in os.listdir(download_dir):
+        if filename.endswith('.pdf'):
+            file_path = os.path.join(download_dir, filename)
+            text = ""
+            try:
+                with open(file_path, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    for page_num in range(len(reader.pages)):
+                        text += reader.pages[page_num].extract_text()
+
+                extracted_data = {"file_name": filename}
+
+                for section, pattern in patterns.items():
+                    match = re.search(pattern, text, re.DOTALL)
+                    if match:
+                         if len(match.groups()) > 1:
+                            extracted_data[section] = next((group.strip() for group in match.groups() if group is not None), None)
+                         else:
+                             extracted_data[section] = match.group(1).strip()
+                    else:
+                        extracted_data[section] = None
+
+                if all(extracted_data.get(sec) is None for sec in ["facts", "legal_issues", "holdings", "reasoning", "citations"]):
+                     main_body_match = re.search(r"Case Name:.*?Judges:.*?\n(.*)", text, re.DOTALL)
+                     if main_body_match:
+                         extracted_data["holdings"] = main_body_match.group(1).strip()
+
+
+                all_cases_data.append(CaseData(**extracted_data))
+
+            except PyPDF2.errors.PdfReadError:
+                print(f"Could not read PDF file {filename}. Skipping.")
+                all_cases_data.append(CaseData(file_name=filename, classification="Unreadable PDF"))
+            except Exception as e:
+                print(f"Error processing {filename}: {e}")
+                all_cases_data.append(CaseData(file_name=filename, classification=f"Processing Error: {e}"))
+
+    print(f"Processed {len(all_cases_data)} PDF files.")
+
+    # --- Keyword-based classification ---
+    for case in all_cases_data:
+        classify_case(case)
+    print(f"Classified {len(all_cases_data)} cases.")
+
+    # --- Identify potential additional classifiers ---
+    all_text_for_analysis = ""
+    for case in all_cases_data:
+        if case.case_name:
+            all_text_for_analysis += case.case_name + " "
+        if case.facts:
+            all_text_for_analysis += case.facts + " "
+        if case.legal_issues:
+            all_text_for_analysis += case.legal_issues + " "
+        if case.holdings:
+            all_text_for_analysis += case.holdings + " "
+        if case.reasoning:
+            all_text_for_analysis += case.reasoning + " "
+
+    tokens = all_text_for_analysis.split()
+    tokens = [word.lower().translate(str.maketrans('', '', string.punctuation)) for word in tokens]
+    tokens = [word for word in tokens if word]
+    stop_words = set(stopwords.words('english'))
+    filtered_tokens = [word for word in tokens if word not in stop_words]
+    word_frequencies = Counter(filtered_tokens)
+    most_common_words = word_frequencies.most_common(50)
+
+    print("\nPotential additional classifiers and their frequencies:")
+    for word, frequency in most_common_words:
+        print(f"{word}: {frequency}")
+
+    # --- Structure the Data ---
+    structured_data_list = []
+    for case in all_cases_data:
+        structured_data_list.append({
+            "file_name": case.file_name,
+            "case_name": case.case_name,
+            "judges": case.judges,
+            "facts": case.facts,
+            "legal_issues": case.legal_issues,
+            "holdings": case.holdings,
+            "reasoning": case.reasoning,
+            "citations": case.citations,
+            "classification": case.classification
+        })
+    print(f"\nCreated a structured list containing data for {len(structured_data_list)} cases.")
+
+
+    # --- Save Data to CSV ---
+    output_csv_file = 'case_data.csv'
+    with open(output_csv_file, 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ["file_name", "case_name", "judges", "facts", "legal_issues", "holdings", "reasoning", "citations", "classification"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for case_data in structured_data_list:
+            writer.writerow(case_data)
+    print(f"Successfully saved data for {len(structured_data_list)} cases to {output_csv_file}")
+
+    # --- Save Data to JSON ---
+    output_json_file = 'case_data.json'
+    with open(output_json_file, 'w', encoding='utf-8') as jsonfile:
+        json.dump(structured_data_list, jsonfile, indent=4)
+    print(f"Successfully saved data for {len(structured_data_list)} cases to {output_json_file}")
+
+    # --- Save Data to a third format (Pickle) ---
+    output_pickle_file = 'case_data.pkl'
+    with open(output_pickle_file, 'wb') as pklfile:
+        pickle.dump(structured_data_list, pklfile)
+    print(f"Successfully saved data for {len(structured_data_list)} cases to {output_pickle_file}")
+
+    # --- Save Data to TXT ---
+    output_txt_file = 'case_data.txt'
+    with open(output_txt_file, 'w', encoding='utf-8') as txtfile:
+        for case_data in structured_data_list:
+            txtfile.write(f"File Name: {case_data.get('file_name', 'N/A')}\n")
+            txtfile.write(f"Case Name: {case_data.get('case_name', 'N/A')}\n")
+            txtfile.write(f"Judges: {case_data.get('judges', 'N/A')}\n")
+            txtfile.write(f"Classification: {case_data.get('classification', 'N/A')}\n")
+            txtfile.write("--- Facts/Background ---\n")
+            txtfile.write(f"{case_data.get('facts', 'N/A')}\n\n")
+            txtfile.write("--- Legal Issues ---\n")
+            txtfile.write(f"{case_data.get('legal_issues', 'N/A')}\n\n")
+            txtfile.write("--- Holdings/Decision ---\n")
+            txtfile.write(f"{case_data.get('holdings', 'N/A')}\n\n")
+            txtfile.write("--- Reasoning/Discussion ---\n")
+            txtfile.write(f"{case_data.get('reasoning', 'N/A')}\n\n")
+            txtfile.write("--- Citations ---\n")
+            txtfile.write(f"{case_data.get('citations', 'N/A')}\n")
+            txtfile.write("-" * 50 + "\n\n") # Delimiter
+    print(f"Successfully saved data for {len(structured_data_list)} cases to {output_txt_file}")
+
+    # --- Save Data to XML ---
+    output_xml_file = 'case_data.xml'
+    root = ET.Element('cases')
+    for case_data in structured_data_list:
+        case_element = ET.SubElement(root, 'case')
+        for field in ["file_name", "case_name", "judges", "facts", "legal_issues", "holdings", "reasoning", "citations", "classification"]:
+            sub_element = ET.SubElement(case_element, field)
+            sub_element.text = str(case_data.get(field, 'N/A'))
+    tree = ET.ElementTree(root)
+    with open(output_xml_file, 'w', encoding='utf-8') as xmlfile:
+        xml_string = ET.tostring(root, encoding='unicode', xml_declaration=True)
+        xmlfile.write(xml_string)
+    print(f"Successfully saved data for {len(structured_data_list)} cases to {output_xml_file}")
+
+
+if __name__ == "__main__":
+    main()
